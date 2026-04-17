@@ -255,12 +255,22 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                 // Parse event data — EventData borrows from `event`
                 let data = match event.read_data() {
                     Ok(Some(d)) => d,
-                    _ => continue,
+                    Ok(None) => {
+                        logger.debug(json!({ "message": "Binlog event has no data, skipping" }));
+                        continue;
+                    }
+                    Err(e) => {
+                        logger.debug(json!({ "message": "Failed to read binlog event data", "error": e.to_string() }));
+                        continue;
+                    }
                 };
 
                 let re = match data {
                     EventData::RowsEvent(re) => re,
-                    _ => continue,
+                    other => {
+                        logger.debug(json!({ "message": "Non-rows event, skipping", "event_type": format!("{other:?}").split('(').next().unwrap_or("unknown") }));
+                        continue;
+                    }
                 };
 
                 let operation = match &re {
@@ -273,13 +283,30 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                 let table_id = re.table_id();
                 let tme = match stream.get_tme(table_id) {
                     Some(t) => t,
-                    None => continue,
+                    None => {
+                        logger.debug(json!({ "message": "No TableMapEvent for table_id, skipping", "table_id": table_id }));
+                        continue;
+                    }
                 };
 
                 let database = tme.database_name().to_string();
                 let table    = tme.table_name().to_string();
 
+                logger.debug(json!({
+                    "message":   "Binlog rows event received",
+                    "operation": operation,
+                    "database":  database,
+                    "table":     table,
+                }));
+
                 if !args.should_include(&database, &table) {
+                    logger.debug(json!({
+                        "message":          "Event filtered out",
+                        "database":         database,
+                        "table":            table,
+                        "filter_databases": args.filter_databases(),
+                        "filter_tables":    args.filter_tables(),
+                    }));
                     continue;
                 }
 
