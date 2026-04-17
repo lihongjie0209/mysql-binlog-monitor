@@ -89,11 +89,6 @@ pub async fn find_pos_by_time(
     let mut candidates: Vec<(&BinlogFile, Option<u64>)> = Vec::with_capacity(files.len());
     for f in files {
         let ts = first_event_time(pool, server_id, &f.log_name).await?;
-        eprintln!(
-            "  {} → first_event_time = {}",
-            f.log_name,
-            ts.map(|t| format!("{}", t)).unwrap_or_else(|| "none".into())
-        );
         candidates.push((f, ts));
     }
 
