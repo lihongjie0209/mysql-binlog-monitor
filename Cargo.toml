@@ -1,6 +1,6 @@
 [package]
 name = "mysql-binlog-monitor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Monitor MySQL binlog changes and output structured JSON logs"
 
