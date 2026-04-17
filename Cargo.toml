@@ -1,0 +1,27 @@
+[package]
+name = "mysql-binlog-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Monitor MySQL binlog changes and output structured JSON logs"
+
+[lib]
+name = "mysql_binlog_monitor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mysql-binlog-monitor"
+path = "src/main.rs"
+
+[dependencies]
+mysql_async      = { version = "0.34", default-features = false, features = ["default-rustls"] }
+tokio            = { version = "1",    features = ["full"] }
+tokio-util       = "0.7"
+serde_json       = { version = "1",    features = ["preserve_order"] }
+clap             = { version = "4",    features = ["derive", "env"] }
+chrono           = "0.4"
+anyhow           = "1"
+futures          = "0.3"
+gluesql          = { version = "0.19", default-features = false, features = ["gluesql_sled_storage"] }
+
+[dev-dependencies]
+tempfile         = "3"
