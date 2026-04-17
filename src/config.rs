@@ -112,6 +112,56 @@ pub struct Args {
     #[arg(long, default_value = "id-only",
           value_parser = ["id-only", "full"])]
     pub store_mode: String,
+
+    /// Binlog starting position. Three forms are accepted:
+    ///
+    ///   end          (default) Start from the current live position (SHOW MASTER STATUS).
+    ///                Only events that occur after the monitor starts are captured.
+    ///
+    ///   start        Replay from position 4 of the current binlog file.
+    ///                Useful to re-process today's history.
+    ///
+    ///   <file>:<pos> Start from a specific binlog file and byte offset,
+    ///                e.g. "mysql-bin.042863:380228940".
+    #[arg(long, default_value = "end")]
+    pub binlog_start: String,
+}
+
+// ── Binlog start position ──────────────────────────────────────────────────────
+
+/// Parsed form of the `--binlog-start` argument.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinlogStart {
+    /// Start from the current live position (`SHOW MASTER STATUS`).
+    End,
+    /// Replay from position 4 of the current binlog file (old default behaviour).
+    Start,
+    /// Start from a specific file and byte offset.
+    At { file: String, pos: u64 },
+}
+
+impl Args {
+    /// Parse the `--binlog-start` string into a typed `BinlogStart`.
+    ///
+    /// Returns `Err(String)` with a human-readable message on bad input.
+    pub fn parse_binlog_start(&self) -> Result<BinlogStart, String> {
+        match self.binlog_start.as_str() {
+            "end"   => Ok(BinlogStart::End),
+            "start" => Ok(BinlogStart::Start),
+            s => {
+                // Expect "file:pos", e.g. "mysql-bin.042863:380228940"
+                let mut parts = s.rsplitn(2, ':');
+                let pos_str = parts.next().ok_or_else(|| format!("Invalid --binlog-start: '{}'", s))?;
+                let file    = parts.next().ok_or_else(|| {
+                    format!("Invalid --binlog-start '{}': expected <file>:<pos> or 'start' or 'end'", s)
+                })?;
+                let pos: u64 = pos_str.parse().map_err(|_| {
+                    format!("Invalid --binlog-start '{}': position '{}' is not a valid u64", s, pos_str)
+                })?;
+                Ok(BinlogStart::At { file: file.to_string(), pos })
+            }
+        }
+    }
 }
 
 impl Args {
@@ -215,6 +265,7 @@ mod tests {
             server_id: 1, log_file: "".into(), databases: "".into(),
             tables: "".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
+            binlog_start: "end".into(),
         };
         assert!(args.should_include("any_db", "any_table"));
     }
@@ -228,6 +279,7 @@ mod tests {
             databases: "app_*,legacy".into(),
             tables: "".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
+            binlog_start: "end".into(),
         };
         assert!(args.should_include("app_users", "events"));
         assert!(args.should_include("legacy", "orders"));
@@ -242,10 +294,46 @@ mod tests {
             server_id: 1, log_file: "".into(), databases: "".into(),
             tables: "order_*,user?".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
+            binlog_start: "end".into(),
         };
         assert!(args.should_include("db", "order_items"));
         assert!(args.should_include("db", "user1"));
         assert!(!args.should_include("db", "products"));
+    }
+
+    #[test]
+    fn parse_binlog_start_variants() {
+        let mut args = Args {
+            host: "".into(), port: 3306, user: "".into(), password: "".into(),
+            metadata_user: None, metadata_password: None,
+            server_id: 1, log_file: "".into(), databases: "".into(),
+            tables: "".into(), log_level: "info".into(),
+            gluesql_path: None, store_mode: "id-only".into(),
+            binlog_start: "end".into(),
+        };
+        assert_eq!(args.parse_binlog_start().unwrap(), BinlogStart::End);
+
+        args.binlog_start = "start".into();
+        assert_eq!(args.parse_binlog_start().unwrap(), BinlogStart::Start);
+
+        args.binlog_start = "mysql-bin.042863:380228940".into();
+        assert_eq!(
+            args.parse_binlog_start().unwrap(),
+            BinlogStart::At { file: "mysql-bin.042863".into(), pos: 380228940 }
+        );
+
+        // File name with dots and colons should still work — the rightmost colon is the separator
+        args.binlog_start = "mysql-bin.000001:4".into();
+        assert_eq!(
+            args.parse_binlog_start().unwrap(),
+            BinlogStart::At { file: "mysql-bin.000001".into(), pos: 4 }
+        );
+
+        args.binlog_start = "bad-value".into();
+        assert!(args.parse_binlog_start().is_err());
+
+        args.binlog_start = "mysql-bin.000001:notanumber".into();
+        assert!(args.parse_binlog_start().is_err());
     }
 }
 

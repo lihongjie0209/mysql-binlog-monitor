@@ -203,25 +203,45 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
         };
 
         // ── Determine starting binlog position ───────────────────────────────
-        // Default: start from the current (latest) position so we only capture
-        // new events.  Falls back to position 4 if SHOW MASTER STATUS fails.
-        let master_status = match crate::db::fetch_master_status(&meta_pool).await {
-            Ok(status) => {
-                logger.info(json!({
-                    "message": "Starting binlog stream from current position",
-                    "file":    status.0,
-                    "pos":     status.1,
-                }));
-                Some(status)
+        let binlog_start = args.parse_binlog_start().unwrap_or_else(|e| {
+            logger.warn(json!({ "message": "Bad --binlog-start value, defaulting to 'end'", "error": e }));
+            crate::config::BinlogStart::End
+        });
+
+        let master_status: Option<(String, u64)> = match &binlog_start {
+            crate::config::BinlogStart::End => {
+                match crate::db::fetch_master_status(&meta_pool).await {
+                    Ok(status) => {
+                        logger.info(json!({
+                            "message": "Starting binlog stream from current position",
+                            "file":    status.0,
+                            "pos":     status.1,
+                        }));
+                        Some(status)
+                    }
+                    Err(e) => {
+                        logger.warn(json!({
+                            "message": "Could not fetch master status; starting from beginning of current file",
+                            "error":   e.to_string(),
+                        }));
+                        None
+                    }
+                }
             }
-            Err(e) => {
-                logger.warn(json!({
-                    "message": "Could not fetch master status; starting from beginning of current file",
-                    "error":   e.to_string(),
-                }));
+            crate::config::BinlogStart::Start => {
+                logger.info(json!({ "message": "Starting binlog stream from beginning of current binlog file" }));
                 None
             }
+            crate::config::BinlogStart::At { file, pos } => {
+                logger.info(json!({
+                    "message": "Starting binlog stream from specified position",
+                    "file":    file,
+                    "pos":     pos,
+                }));
+                Some((file.clone(), *pos))
+            }
         };
+
         let request = match &master_status {
             Some((file, pos)) => BinlogStreamRequest::new(args.server_id)
                 .with_filename(file.as_bytes())
