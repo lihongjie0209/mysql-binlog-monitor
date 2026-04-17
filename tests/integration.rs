@@ -53,6 +53,7 @@ fn test_args(log_path: &str, db: &str, server_id: u32) -> Args {
         gluesql_path: None,
         store_mode: "id-only".into(),
         binlog_start: "end".into(),
+        since: None,
     }
 }
 
@@ -382,6 +383,7 @@ async fn test_wildcard_db_filter() {
         gluesql_path: None,
         store_mode: "id-only".into(),
         binlog_start: "end".into(),
+        since: None,
     };
 
     let token = CancellationToken::new();
@@ -465,6 +467,7 @@ async fn test_wildcard_table_filter() {
         gluesql_path: None,
         store_mode: "id-only".into(),
         binlog_start: "end".into(),
+        since: None,
     };
 
     let token = CancellationToken::new();

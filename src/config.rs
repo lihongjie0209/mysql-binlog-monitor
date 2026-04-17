@@ -127,6 +127,14 @@ pub struct Args {
     ///                e.g. "mysql-bin.042863:380228940".
     #[arg(long, default_value = "end")]
     pub binlog_start: String,
+
+    /// Start monitoring from this point in time instead of from the current position.
+    /// Scans available binlog files to find the exact file + byte offset.
+    /// Accepted formats: RFC 3339 (2026-04-17T10:00:00Z, 2026-04-17T10:00:00+08:00)
+    /// or 'YYYY-MM-DD HH:MM:SS' (treated as UTC).
+    /// Takes precedence over --binlog-start when both are set.
+    #[arg(long)]
+    pub since: Option<String>,
 }
 
 // ── Binlog start position ──────────────────────────────────────────────────────
@@ -256,6 +264,22 @@ pub struct BinlogInfoArgs {
     #[arg(long, default_value = "table",
           value_parser = ["table", "json"])]
     pub format: String,
+
+    /// Replication server ID used to open the binlog stream for timestamp scanning.
+    /// Only needed with --since / --until. Must be unique within the cluster.
+    #[arg(long, default_value_t = 200)]
+    pub server_id: u32,
+
+    /// Show only binlog files whose events fall on or after this datetime.
+    /// Accepted formats: RFC 3339 (2026-04-17T10:00:00Z, 2026-04-17T10:00:00+08:00)
+    /// or 'YYYY-MM-DD HH:MM:SS' (UTC).
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Show only binlog files whose events fall on or before this datetime.
+    /// Same format as --since.
+    #[arg(long)]
+    pub until: Option<String>,
 }
 
 
@@ -296,6 +320,7 @@ mod tests {
             tables: "".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
+            since: None,
         };
         assert!(args.should_include("any_db", "any_table"));
     }
@@ -310,6 +335,7 @@ mod tests {
             tables: "".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
+            since: None,
         };
         assert!(args.should_include("app_users", "events"));
         assert!(args.should_include("legacy", "orders"));
@@ -325,6 +351,7 @@ mod tests {
             tables: "order_*,user?".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
+            since: None,
         };
         assert!(args.should_include("db", "order_items"));
         assert!(args.should_include("db", "user1"));
@@ -340,6 +367,7 @@ mod tests {
             tables: "".into(), log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
+            since: None,
         };
         assert_eq!(args.parse_binlog_start().unwrap(), BinlogStart::End);
 

@@ -203,42 +203,89 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
         };
 
         // ── Determine starting binlog position ───────────────────────────────
-        let binlog_start = args.parse_binlog_start().unwrap_or_else(|e| {
-            logger.warn(json!({ "message": "Bad --binlog-start value, defaulting to 'end'", "error": e }));
-            crate::config::BinlogStart::End
-        });
-
-        let master_status: Option<(String, u64)> = match &binlog_start {
-            crate::config::BinlogStart::End => {
-                match crate::db::fetch_master_status(&meta_pool).await {
-                    Ok(status) => {
-                        logger.info(json!({
-                            "message": "Starting binlog stream from current position",
-                            "file":    status.0,
-                            "pos":     status.1,
-                        }));
-                        Some(status)
+        // --since takes precedence over --binlog-start when both are provided.
+        let master_status: Option<(String, u64)> = if let Some(since_str) = &args.since {
+            match crate::time_seek::parse_datetime(since_str) {
+                Err(e) => {
+                    logger.warn(json!({ "message": "Bad --since value, falling back to 'end'", "error": e.to_string() }));
+                    match crate::db::fetch_master_status(&meta_pool).await {
+                        Ok(s) => Some(s),
+                        Err(_) => None,
                     }
-                    Err(e) => {
-                        logger.warn(json!({
-                            "message": "Could not fetch master status; starting from beginning of current file",
-                            "error":   e.to_string(),
-                        }));
-                        None
+                }
+                Ok(target_ts) => {
+                    logger.info(json!({
+                        "message": "Seeking binlog position by time",
+                        "since":      since_str,
+                        "target_unix": target_ts,
+                    }));
+                    match crate::db::fetch_binary_logs(&meta_pool).await {
+                        Err(e) => {
+                            logger.warn(json!({ "message": "Could not list binary logs", "error": e.to_string() }));
+                            None
+                        }
+                        Ok(files) => {
+                            let (cur_file, cur_pos) = crate::db::fetch_master_status(&meta_pool)
+                                .await
+                                .unwrap_or_default();
+                            match crate::time_seek::find_pos_by_time(
+                                &meta_pool, args.server_id, &files, target_ts, &cur_file, cur_pos,
+                            ).await {
+                                Err(e) => {
+                                    logger.warn(json!({ "message": "Time seek failed, using current pos", "error": e.to_string() }));
+                                    Some((cur_file, cur_pos))
+                                }
+                                Ok((file, pos)) => {
+                                    logger.info(json!({
+                                        "message": "Binlog position found by time seek",
+                                        "file": file,
+                                        "pos":  pos,
+                                    }));
+                                    Some((file, pos))
+                                }
+                            }
+                        }
                     }
                 }
             }
-            crate::config::BinlogStart::Start => {
-                logger.info(json!({ "message": "Starting binlog stream from beginning of current binlog file" }));
-                None
-            }
-            crate::config::BinlogStart::At { file, pos } => {
-                logger.info(json!({
-                    "message": "Starting binlog stream from specified position",
-                    "file":    file,
-                    "pos":     pos,
-                }));
-                Some((file.clone(), *pos))
+        } else {
+            let binlog_start = args.parse_binlog_start().unwrap_or_else(|e| {
+                logger.warn(json!({ "message": "Bad --binlog-start value, defaulting to 'end'", "error": e }));
+                crate::config::BinlogStart::End
+            });
+
+            match &binlog_start {
+                crate::config::BinlogStart::End => {
+                    match crate::db::fetch_master_status(&meta_pool).await {
+                        Ok(status) => {
+                            logger.info(json!({
+                                "message": "Starting binlog stream from current position",
+                                "file":    status.0,
+                                "pos":     status.1,
+                            }));
+                            Some(status)
+                        }
+                        Err(e) => {
+                            logger.warn(json!({
+                                "message": "Could not fetch master status; starting from beginning of current file",
+                                "error":   e.to_string(),
+                            }));
+                            None
+                        }
+                    }
+                }
+                crate::config::BinlogStart::Start => {
+                    logger.info(json!({ "message": "Starting binlog stream from beginning of current binlog file" }));
+                    None
+                }
+                crate::config::BinlogStart::At { file, pos } => {
+                    logger.info(json!({
+                        "message": "Starting binlog stream from specified position",
+                        "file":    file,
+                        "pos":     pos,
+                    }));
+                    Some((file.clone(), *pos))
+                }
             }
         };
 
