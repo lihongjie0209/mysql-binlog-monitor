@@ -202,7 +202,32 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
             }
         };
 
-        let request = BinlogStreamRequest::new(args.server_id);
+        // ── Determine starting binlog position ───────────────────────────────
+        // Default: start from the current (latest) position so we only capture
+        // new events.  Falls back to position 4 if SHOW MASTER STATUS fails.
+        let master_status = match crate::db::fetch_master_status(&meta_pool).await {
+            Ok(status) => {
+                logger.info(json!({
+                    "message": "Starting binlog stream from current position",
+                    "file":    status.0,
+                    "pos":     status.1,
+                }));
+                Some(status)
+            }
+            Err(e) => {
+                logger.warn(json!({
+                    "message": "Could not fetch master status; starting from beginning of current file",
+                    "error":   e.to_string(),
+                }));
+                None
+            }
+        };
+        let request = match &master_status {
+            Some((file, pos)) => BinlogStreamRequest::new(args.server_id)
+                .with_filename(file.as_bytes())
+                .with_pos(*pos),
+            None => BinlogStreamRequest::new(args.server_id),
+        };
         let mut stream = match conn.get_binlog_stream(request).await {
             Ok(s) => s,
             Err(e) => {
@@ -252,6 +277,13 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default();
 
+                // Log every raw event at trace level for deep debugging
+                logger.debug(json!({
+                    "message":    "Raw binlog event",
+                    "event_type": format!("{:?}", event.header().event_type()),
+                    "timestamp":  event.header().timestamp(),
+                }));
+
                 // Parse event data — EventData borrows from `event`
                 let data = match event.read_data() {
                     Ok(Some(d)) => d,
@@ -267,6 +299,15 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
 
                 let re = match data {
                     EventData::RowsEvent(re) => re,
+                    EventData::TableMapEvent(ref tme_data) => {
+                        logger.debug(json!({
+                            "message":  "TableMapEvent received",
+                            "table_id": tme_data.table_id(),
+                            "database": tme_data.database_name(),
+                            "table":    tme_data.table_name(),
+                        }));
+                        continue;
+                    }
                     other => {
                         logger.debug(json!({ "message": "Non-rows event, skipping", "event_type": format!("{other:?}").split('(').next().unwrap_or("unknown") }));
                         continue;

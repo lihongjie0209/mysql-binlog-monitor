@@ -68,6 +68,18 @@ pub async fn fetch_primary_keys_for_table(
     Ok(rows)
 }
 
+/// Fetch current binlog file and position via SHOW MASTER STATUS.
+pub async fn fetch_master_status(pool: &Pool) -> Result<(String, u64)> {
+    let mut conn = pool.get_conn().await?;
+    let row: mysql_async::Row = conn
+        .query_first("SHOW MASTER STATUS")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("SHOW MASTER STATUS returned no rows"))?;
+    let file: String = row.get(0).ok_or_else(|| anyhow::anyhow!("Missing File column"))?;
+    let pos: u64    = row.get(1).ok_or_else(|| anyhow::anyhow!("Missing Position column"))?;
+    Ok((file, pos))
+}
+
 /// Fetch column names for a single table (used for newly-seen tables).
 pub async fn fetch_column_names_for_table(
     pool: &Pool,
