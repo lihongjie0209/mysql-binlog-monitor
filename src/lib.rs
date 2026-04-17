@@ -1,3 +1,4 @@
+pub mod binlog_info;
 pub mod config;
 pub mod db;
 pub mod export;

@@ -44,6 +44,8 @@ pub enum Command {
     Monitor(Args),
     /// Export events stored in a GlueSQL database to JSON or CSV.
     Export(ExportArgs),
+    /// Show available binlog files and the current write position.
+    BinlogInfo(BinlogInfoArgs),
 }
 
 // ── Monitor args ───────────────────────────────────────────────────────────────
@@ -228,6 +230,34 @@ pub struct ExportArgs {
     #[arg(long)]
     pub limit: Option<u64>,
 }
+
+// ── BinlogInfo args ────────────────────────────────────────────────────────────
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(about = "Show available binlog files and the current write position.")]
+pub struct BinlogInfoArgs {
+    /// MySQL host
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// MySQL port
+    #[arg(long, default_value_t = 3306)]
+    pub port: u16,
+
+    /// MySQL user (needs REPLICATION CLIENT privilege)
+    #[arg(long, default_value = "root")]
+    pub user: String,
+
+    /// MySQL password (or set MYSQL_PASSWORD env var)
+    #[arg(long, env = "MYSQL_PASSWORD")]
+    pub password: String,
+
+    /// Output format: "table" (human-readable) or "json"
+    #[arg(long, default_value = "table",
+          value_parser = ["table", "json"])]
+    pub format: String,
+}
+
 
 #[cfg(test)]
 mod tests {

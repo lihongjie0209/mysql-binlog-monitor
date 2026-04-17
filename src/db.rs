@@ -68,7 +68,26 @@ pub async fn fetch_primary_keys_for_table(
     Ok(rows)
 }
 
-/// Fetch current binlog file and position via SHOW MASTER STATUS.
+/// One row from SHOW BINARY LOGS.
+#[derive(Debug)]
+pub struct BinlogFile {
+    pub log_name:  String,
+    pub file_size: u64,
+}
+
+/// Fetch all available binlog files via SHOW BINARY LOGS.
+pub async fn fetch_binary_logs(pool: &Pool) -> Result<Vec<BinlogFile>> {
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<mysql_async::Row> = conn.query("SHOW BINARY LOGS").await?;
+    let mut files = Vec::with_capacity(rows.len());
+    for row in rows {
+        let log_name: String = row.get(0).ok_or_else(|| anyhow::anyhow!("Missing Log_name"))?;
+        let file_size: u64   = row.get(1).ok_or_else(|| anyhow::anyhow!("Missing File_size"))?;
+        files.push(BinlogFile { log_name, file_size });
+    }
+    Ok(files)
+}
+
 pub async fn fetch_master_status(pool: &Pool) -> Result<(String, u64)> {
     let mut conn = pool.get_conn().await?;
     let row: mysql_async::Row = conn
