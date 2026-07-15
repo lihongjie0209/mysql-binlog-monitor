@@ -132,17 +132,21 @@ async fn scan_file_for_time(
 
     while let Some(ev) = stream.next().await {
         let ev = ev?;
-        let current_start = next_start;
-        // log_pos in the header is the end offset of this event (= start of next)
-        next_start = ev.header().log_pos() as u64;
+        let current_start = next_start.max(4);
+        // log_pos in the header is the end offset of this event (= start of next).
+        // Some events report 0 — do not clobber the running offset with that.
+        let lp = ev.header().log_pos() as u64;
+        if lp > 0 {
+            next_start = lp;
+        }
 
         let ts = ev.header().timestamp() as u64;
         if ts > 0 && ts >= target_ts {
-            return Ok(current_start);
+            return Ok(current_start.max(4));
         }
-        last_pos = next_start;
+        last_pos = next_start.max(4);
     }
 
     // All events are before target_ts — return end of file
-    Ok(last_pos)
+    Ok(last_pos.max(4))
 }

@@ -20,15 +20,20 @@
 | | |
 |---|---|
 | 🚀 **High-performance** | Built in Rust with async I/O via `tokio` + `mysql_async` |
-| 📋 **Structured JSON logs** | One JSON object per line, stdout + rotating log file |
+| 📋 **Structured JSON logs** | One JSON object per line, stdout + optional size-based rotation (`--log-max-bytes`) |
 | 🔑 **Primary key resolution** | Fetches PK and column names from `information_schema` |
 | 🌐 **Wildcard filters** | Filter databases/tables with `*` and `?` patterns |
+| 🔎 **Field filters** | `--field-filter COL=VALUE` (repeatable AND; value supports wildcards) |
 | 🕐 **Flexible start position** | Start from current position, file beginning, specific file:offset, or a timestamp |
 | ⏱️ **Time-based seek** | `--since` scans binlog files to find the exact replay position for a given datetime |
 | 📊 **Binlog inspection** | `binlog-info` lists all binlog files with size and UTC time ranges |
 | 💾 **Embedded persistence** | Optional GlueSQL (sled) storage — id-only or full row |
+| 📜 **Historical scan** | One-shot `scan` by db/table/time — no continuous follow |
 | 📤 **Export** | Dump stored events to JSON array or CSV with filters |
-| 🔄 **Auto-reconnect** | Exponential backoff (1 s → 60 s) on connection loss |
+| 🔄 **Auto-reconnect** | Exponential backoff (1 s → 60 s); resumes from last in-memory position |
+| 📍 **Checkpoint** | Optional `--checkpoint-path` persists `file:pos` + `gtid_set` for restart resume |
+| 🧬 **GTID mode** | `--gtid` uses COM_BINLOG_DUMP_GTID; events include `gtid`; GlueSQL dedupes by GTID |
+| 🧱 **DDL-aware metadata** | Clears column/PK cache on `ALTER`/`CREATE`/`DROP`/`RENAME`/`TRUNCATE` |
 | 🔐 **Split credentials** | Separate metadata user when replication user lacks `SELECT` |
 
 ---
@@ -115,15 +120,33 @@ mysql-binlog-monitor monitor --password secret \
 mysql-binlog-monitor monitor --password secret \
   --binlog-start "mysql-bin.000003:4096"
 
-# Watch specific databases (wildcard) and persist events
+# Watch specific databases (wildcard) and persist events + checkpoint
 mysql-binlog-monitor monitor --password secret \
   --databases "shop_*,analytics" \
   --tables "orders,products" \
   --gluesql-path ./events.db \
-  --store-mode full
+  --store-mode full \
+  --checkpoint-path ./checkpoint.json
 ```
 
-### 3. Export stored events
+### 3. Historical scan (one-shot)
+
+```bash
+# Replay retained binlog for a table/time window, then exit
+mysql-binlog-monitor scan --password secret \
+  --databases "shop_*" \
+  --tables "orders" \
+  --field-filter status=paid \
+  --field-filter "email=*@example.com" \
+  --since "2026-04-17T00:00:00Z" \
+  --until "2026-04-17T12:00:00Z" \
+  --output orders.jsonl \
+  --limit 10000
+```
+
+Does **not** keep running. Writes one JSON event per line (NDJSON) to stdout or `--output`. Progress summaries go to **stderr**.
+
+### 4. Export stored events
 
 ```bash
 # JSON to stdout
@@ -159,13 +182,17 @@ mysql-binlog-monitor monitor --password <PASSWORD> [OPTIONS]
 | `--metadata-password` | same as `--password` | Password — or `MYSQL_METADATA_PASSWORD` env var |
 | `--server-id` | `100` | Replication server ID (must be unique in cluster) |
 | `--log-file` | `binlog.log` | Output log file (newline-delimited JSON) |
+| `--log-max-bytes` | `0` | Rotate log to `<file>.1` when size would exceed N bytes (`0` = never) |
 | `--databases` | *(all)* | Comma-separated list; supports `*` / `?` wildcards |
 | `--tables` | *(all)* | Comma-separated list; supports `*` / `?` wildcards |
+| `--field-filter` | *(none)* | Repeatable `COL=VALUE` (AND). UPDATE matches before or after. Value may use `*`/`?` |
 | `--log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `--gluesql-path` | *(disabled)* | Enable GlueSQL persistence at this directory |
 | `--store-mode` | `id-only` | `id-only` = metadata only · `full` = include row JSON |
 | `--binlog-start` | `end` | Starting position — see table below |
 | `--since` | *(none)* | Seek to this datetime before streaming (overrides `--binlog-start`) |
+| `--checkpoint-path` | *(disabled)* | JSON file storing last consumed `file:pos` + `gtid_set`; enables restart resume when `--binlog-start end` and no `--since` |
+| `--gtid` | `auto` | `auto` = detect server `gtid_mode` · `on` = prefer GTID · `off` = file:pos only. Bare `--gtid` = `on` |
 
 #### `--binlog-start` values
 
@@ -185,7 +212,97 @@ Accepted formats (all interpreted as UTC unless a timezone offset is given):
 2026-04-17 10:00:00           # SQL-style datetime (UTC)
 ```
 
+#### Checkpoint resume
+
+Start-position priority (first match wins):
+
+1. **In-memory resume** (file:pos, or GTID set when `--gtid`)
+2. **`--since`** time seek
+3. Explicit **`--binlog-start`** (`start` / `file:pos`)
+4. **Disk checkpoint** when `--binlog-start end` and no `--since`
+   - with `--gtid` + non-empty `gtid_set` → GTID auto-position
+   - otherwise file:pos
+5. Live end (`SHOW MASTER STATUS`, or `@@gtid_executed` when `--gtid`)
+
+Checkpoint file format:
+
+```json
+{
+  "file": "mysql-bin.000003",
+  "pos": 125638,
+  "gtid_set": "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+  "last_gtid": "3e11fa47-71ca-11e1-9e33-c80aa9429562:5"
+}
+```
+
+#### GTID / delivery semantics
+
+| Layer | Guarantee | How |
+|---|---|---|
+| Stream resume (GTID + checkpoint) | **At-least-once** source, no full replay of executed set | `COM_BINLOG_DUMP_GTID` with executed set |
+| JSON log | At-least-once (may duplicate if crash after write before checkpoint) | Downstream should key on `gtid` |
+| GlueSQL (`--gluesql-path`) | **Effectively exactly-once** per GTID | `processed_gtids` table skips duplicates |
+
+**Auto-detect (default):** at startup the monitor reads `@@GLOBAL.gtid_mode`.
+
+| `--gtid` | Server `gtid_mode=ON` | Behaviour |
+|---|---|---|
+| `auto` *(default)* | yes | GTID dump + `gtid` on events |
+| `auto` | no | file:pos dump (classic) |
+| `on` / bare `--gtid` | yes | GTID dump |
+| `on` | no | **warn** and fall back to file:pos |
+| `off` | * | always file:pos |
+
+MySQL prerequisites for GTID path:
+
+```ini
+gtid-mode                = ON
+enforce-gtid-consistency = ON
+```
+
+```bash
+# Auto: enable GTID only when the server supports it
+mysql-binlog-monitor monitor --password secret \
+  --checkpoint-path ./checkpoint.json \
+  --gluesql-path ./events.db
+
+# Force prefer GTID (same as bare --gtid)
+mysql-binlog-monitor monitor --password secret --gtid on
+
+# Never use GTID dump
+mysql-binlog-monitor monitor --password secret --gtid off
+```
+
 ---
+
+### `scan` subcommand
+
+```
+mysql-binlog-monitor scan --password <PASSWORD> [OPTIONS]
+```
+
+One-shot historical dump of ROW events. Uses a **non-blocking** binlog stream so the process exits when retained history is exhausted (or when `--until` / `--limit` is hit).
+
+| Option | Default | Description |
+|---|---|---|
+| `--host` / `--port` / `--user` / `--password` | same as monitor | Connection |
+| `--metadata-user` / `--metadata-password` | same as user | `information_schema` access |
+| `--server-id` | `300` | Dump server id (unique per concurrent client) |
+| `--databases` | *(all)* | Comma list; `*` / `?` wildcards |
+| `--tables` | *(all)* | Comma list; `*` / `?` wildcards |
+| `--field-filter` | *(none)* | Repeatable `COL=VALUE` (AND); same semantics as monitor |
+| `--since` | *(earliest retained)* | Start time (also seeks binlog position) |
+| `--until` | *(EOF)* | Stop after this event time |
+| `--binlog-start` | *(first file:4)* | Exact `file:pos` start (optional) |
+| `--output` | stdout | NDJSON file path |
+| `--limit` | *(all)* | Max matching row events to emit |
+| `--gtid` | `auto` | Same semantics as monitor (`auto`/`on`/`off`) |
+
+Start position rules:
+
+1. `--binlog-start file:pos` if set  
+2. else `--since` time seek  
+3. else first available binary log at position 4  
 
 ### `binlog-info` subcommand
 
@@ -329,6 +446,7 @@ The log file contains **one JSON object per line**. Each entry wraps the change 
 | `table` | string | Source table |
 | `pk_columns` | `string[]` \| `null` | Primary key column names; `null` if unknown |
 | `primary_key` | `object` \| `null` | `{col: value}` for each PK column |
+| `gtid` | string \| omitted | Transaction GTID (`uuid:gno`) when GTID events are present |
 | `row.values` | object | Full row (INSERT / DELETE) |
 | `row.before_values` | object | Row state before change (UPDATE) |
 | `row.after_values` | object | Row state after change (UPDATE) |
@@ -350,7 +468,12 @@ CREATE TABLE IF NOT EXISTS binlog_events (
     db_name     TEXT,      -- source database
     table_name  TEXT,      -- source table
     primary_key TEXT,      -- JSON-encoded PK object, e.g. {"id":42}
-    row_data    TEXT       -- NULL (id-only) · JSON row object (full)
+    row_data    TEXT,      -- NULL (id-only) · JSON row object (full)
+    gtid        TEXT       -- uuid:gno when GTID is available, else NULL
+)
+
+CREATE TABLE IF NOT EXISTS processed_gtids (
+    gtid TEXT               -- for exactly-once local sink dedupe
 )
 ```
 
@@ -435,16 +558,22 @@ mysql-binlog-monitor/
 │       ├── ci.yml          # Build + unit tests on every push / PR
 │       └── release.yml     # Cross-compile + publish GitHub Release on v* tags
 ├── src/
-│   ├── main.rs             # Entry point — dispatches monitor / export / binlog-info
+│   ├── main.rs             # Entry point — monitor / scan / export / binlog-info
 │   ├── lib.rs              # Crate root
-│   ├── config.rs           # Cli, Args (monitor), ExportArgs, BinlogInfoArgs; wildcard matching
-│   ├── monitor.rs          # Binlog streaming loop with exponential backoff
-│   ├── binlog_info.rs      # binlog-info subcommand — file list + time ranges
-│   ├── time_seek.rs        # --since datetime parser + file/offset locator
-│   ├── db.rs               # information_schema helpers + SHOW MASTER STATUS / BINARY LOGS
+│   ├── config.rs           # Cli + Monitor/Scan/Export/BinlogInfo args; wildcards
+│   ├── monitor.rs          # Continuous binlog streaming + checkpoint
+│   ├── scan.rs             # One-shot historical scan
+│   ├── event.rs            # Shared row→JSON / event builders
+│   ├── checkpoint.rs       # file:pos + gtid_set checkpoint
+│   ├── gtid.rs             # GTID helpers
+│   ├── ddl.rs              # DDL detection for metadata invalidation
+│   ├── binlog_info.rs      # binlog-info subcommand
+│   ├── time_seek.rs        # datetime parse + file/offset seek
+│   ├── db.rs               # information_schema / BINARY LOGS helpers
 │   ├── logger.rs           # JSON log writer
-│   ├── storage.rs          # GlueSQL EventStorage — insert + schema management
-│   └── export.rs           # Export runner — JSON and CSV writers
+│   ├── storage.rs          # GlueSQL EventStorage
+│   └── export.rs           # GlueSQL export
+├── docker-compose.yml      # Local MySQL 8 with ROW binlog for integration tests
 └── tests/
     └── integration.rs      # Integration tests against live Docker MySQL
 ```

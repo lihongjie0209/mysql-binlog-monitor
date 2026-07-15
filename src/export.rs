@@ -69,7 +69,7 @@ fn build_query(args: &ExportArgs) -> String {
     };
 
     format!(
-        "SELECT id, captured_at, event_time, operation, db_name, table_name, primary_key, row_data \
+        "SELECT id, captured_at, event_time, operation, db_name, table_name, primary_key, row_data, gtid \
          FROM binlog_events{where_clause} ORDER BY id{limit_clause}"
     )
 }

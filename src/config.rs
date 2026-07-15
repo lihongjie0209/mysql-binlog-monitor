@@ -21,8 +21,16 @@ fn wm(p: &[char], t: &[char]) -> bool {
     }
 }
 
-fn matches_any(patterns: &[String], value: &str) -> bool {
+pub fn matches_any(patterns: &[String], value: &str) -> bool {
     patterns.iter().any(|pat| wildmatch(pat, value))
+}
+
+/// Split a comma-separated filter list, trimming empties.
+pub fn parse_csv_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
 }
 
 // ── Top-level CLI ──────────────────────────────────────────────────────────────
@@ -42,6 +50,8 @@ pub struct Cli {
 pub enum Command {
     /// Monitor MySQL binlog and stream events to a JSON log file (and optionally GlueSQL).
     Monitor(Args),
+    /// One-shot historical scan of binlog events (no continuous follow).
+    Scan(ScanArgs),
     /// Export events stored in a GlueSQL database to JSON or CSV.
     Export(ExportArgs),
     /// Show available binlog files and the current write position.
@@ -81,6 +91,11 @@ pub struct Args {
     #[arg(long, default_value = "binlog.log")]
     pub log_file: String,
 
+    /// Rotate the log file when it exceeds this many bytes (0 = never rotate).
+    /// The previous file is renamed to `<log-file>.1`.
+    #[arg(long, default_value_t = 0)]
+    pub log_max_bytes: u64,
+
     /// MySQL user for metadata queries (information_schema).
     /// If omitted, uses --user. Set this when the replication user lacks SELECT privilege.
     #[arg(long)]
@@ -98,6 +113,12 @@ pub struct Args {
     /// Comma-separated tables to monitor, supports wildcards * and ? (omit for all)
     #[arg(long, default_value = "")]
     pub tables: String,
+
+    /// Filter by row field values. Repeatable; all conditions must match (AND).
+    /// Format: `COL=VALUE` (value supports `*` / `?`). For UPDATE, matches if
+    /// either before or after row satisfies the predicates.
+    #[arg(long = "field-filter", value_name = "COL=VALUE")]
+    pub field_filters: Vec<String>,
 
     /// Log level: debug | info | warn | error
     #[arg(long, default_value = "info",
@@ -135,6 +156,41 @@ pub struct Args {
     /// Takes precedence over --binlog-start when both are set.
     #[arg(long)]
     pub since: Option<String>,
+
+    /// Path to a JSON checkpoint file that stores the last consumed binlog position.
+    ///
+    /// When set:
+    /// - On startup (with default `--binlog-start end` and no `--since`), resume from
+    ///   the saved file:pos / gtid_set if the file exists.
+    /// - After each processed event / committed GTID, the checkpoint is written atomically.
+    /// - On reconnect, the in-memory position is always preferred (even without this flag).
+    #[arg(long)]
+    pub checkpoint_path: Option<String>,
+
+    /// GTID streaming mode for COM_BINLOG_DUMP_GTID:
+    ///
+    ///   auto  (default) Detect server `gtid_mode`; enable GTID dump when ON.
+    ///   on              Prefer GTID; fall back to file:pos with a warning if unavailable.
+    ///   off             Never use GTID dump (file:pos only).
+    ///
+    /// Bare `--gtid` (no value) is treated as `on`.
+    /// With `--checkpoint-path`, the executed GTID set is persisted for resume.
+    /// Combined with GlueSQL GTID dedupe this provides effectively exactly-once local persistence.
+    #[arg(
+        long,
+        default_value = "auto",
+        num_args = 0..=1,
+        default_missing_value = "on",
+        value_parser = ["auto", "on", "off"]
+    )]
+    pub gtid: String,
+}
+
+impl Args {
+    /// Parse `--gtid` into a typed preference.
+    pub fn gtid_preference(&self) -> crate::gtid::GtidPreference {
+        crate::gtid::GtidPreference::parse(&self.gtid).unwrap_or(crate::gtid::GtidPreference::Auto)
+    }
 }
 
 // ── Binlog start position ──────────────────────────────────────────────────────
@@ -176,31 +232,155 @@ impl Args {
 
 impl Args {
     pub fn filter_databases(&self) -> Vec<String> {
-        self.databases
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        parse_csv_list(&self.databases)
     }
 
     pub fn filter_tables(&self) -> Vec<String> {
-        self.tables
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        parse_csv_list(&self.tables)
     }
 
     pub fn should_include(&self, database: &str, table: &str) -> bool {
-        let dbs = self.filter_databases();
-        let tbls = self.filter_tables();
-        if !dbs.is_empty() && !matches_any(&dbs, database) {
-            return false;
+        crate::event::should_include(
+            &self.filter_databases(),
+            &self.filter_tables(),
+            database,
+            table,
+            matches_any,
+        )
+    }
+
+    pub fn field_predicates(&self) -> Result<Vec<crate::field_filter::FieldPredicate>, String> {
+        crate::field_filter::parse_field_filters(&self.field_filters)
+    }
+}
+
+// ── Scan args (one-shot historical) ────────────────────────────────────────────
+
+#[derive(clap::Args, Debug, Clone)]
+#[command(
+    about = "One-shot scan of historical binlog changes (does not keep running).\n\
+             Filter by database/table wildcards and optional --since / --until time range.\n\
+             Writes one JSON event per line to stdout or --output."
+)]
+pub struct ScanArgs {
+    /// MySQL host
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// MySQL port
+    #[arg(long, default_value_t = 3306)]
+    pub port: u16,
+
+    /// MySQL user
+    #[arg(long, default_value = "root")]
+    pub user: String,
+
+    /// MySQL password (or set MYSQL_PASSWORD env var)
+    #[arg(long, env = "MYSQL_PASSWORD")]
+    pub password: String,
+
+    /// User for information_schema metadata (defaults to --user)
+    #[arg(long)]
+    pub metadata_user: Option<String>,
+
+    /// Password for metadata user (or MYSQL_METADATA_PASSWORD)
+    #[arg(long, env = "MYSQL_METADATA_PASSWORD")]
+    pub metadata_password: Option<String>,
+
+    /// Replication server ID used for the short-lived binlog dump
+    #[arg(long, default_value_t = 300)]
+    pub server_id: u32,
+
+    /// Comma-separated databases; supports * and ? (omit for all)
+    #[arg(long, default_value = "")]
+    pub databases: String,
+
+    /// Comma-separated tables; supports * and ? (omit for all)
+    #[arg(long, default_value = "")]
+    pub tables: String,
+
+    /// Filter by row field values. Repeatable; all must match (AND).
+    /// Format: `COL=VALUE` (value supports `*` / `?`). UPDATE matches before or after.
+    #[arg(long = "field-filter", value_name = "COL=VALUE")]
+    pub field_filters: Vec<String>,
+
+    /// Only events at or after this datetime (RFC 3339 or 'YYYY-MM-DD HH:MM:SS' UTC)
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Only events at or before this datetime (same formats as --since)
+    #[arg(long)]
+    pub until: Option<String>,
+
+    /// Optional exact start `file:pos` (overrides beginning-of-history when no --since)
+    #[arg(long)]
+    pub binlog_start: Option<String>,
+
+    /// Write events to this file instead of stdout (newline-delimited JSON)
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Maximum number of matching events to emit (omit for unlimited)
+    #[arg(long)]
+    pub limit: Option<u64>,
+
+    /// GTID mode for the dump: auto | on | off (same as monitor)
+    #[arg(
+        long,
+        default_value = "auto",
+        num_args = 0..=1,
+        default_missing_value = "on",
+        value_parser = ["auto", "on", "off"]
+    )]
+    pub gtid: String,
+}
+
+impl ScanArgs {
+    pub fn filter_databases(&self) -> Vec<String> {
+        parse_csv_list(&self.databases)
+    }
+
+    pub fn filter_tables(&self) -> Vec<String> {
+        parse_csv_list(&self.tables)
+    }
+
+    pub fn should_include(&self, database: &str, table: &str) -> bool {
+        crate::event::should_include(
+            &self.filter_databases(),
+            &self.filter_tables(),
+            database,
+            table,
+            matches_any,
+        )
+    }
+
+    pub fn field_predicates(&self) -> Result<Vec<crate::field_filter::FieldPredicate>, String> {
+        crate::field_filter::parse_field_filters(&self.field_filters)
+    }
+
+    pub fn gtid_preference(&self) -> crate::gtid::GtidPreference {
+        crate::gtid::GtidPreference::parse(&self.gtid).unwrap_or(crate::gtid::GtidPreference::Auto)
+    }
+
+    /// Parse optional `--binlog-start file:pos` (scan does not accept end/start keywords).
+    pub fn parse_file_pos(&self) -> Result<Option<(String, u64)>, String> {
+        let Some(s) = &self.binlog_start else {
+            return Ok(None);
+        };
+        let mut parts = s.rsplitn(2, ':');
+        let pos_str = parts
+            .next()
+            .ok_or_else(|| format!("Invalid --binlog-start: '{s}'"))?;
+        let file = parts.next().ok_or_else(|| {
+            format!("Invalid --binlog-start '{s}': expected <file>:<pos>")
+        })?;
+        let pos: u64 = pos_str
+            .parse()
+            .map_err(|_| format!("Invalid --binlog-start '{s}': bad position"))?;
+        if pos == 0 {
+            return Err("position must be > 0".into());
         }
-        if !tbls.is_empty() && !matches_any(&tbls, table) {
-            return false;
-        }
-        true
+        Ok(Some((file.to_string(), pos)))
     }
 }
 
@@ -316,11 +496,14 @@ mod tests {
         let args = Args {
             host: "".into(), port: 3306, user: "".into(), password: "".into(),
             metadata_user: None, metadata_password: None,
-            server_id: 1, log_file: "".into(), databases: "".into(),
-            tables: "".into(), log_level: "info".into(),
+            server_id: 1, log_file: "".into(), log_max_bytes: 0,
+            databases: "".into(),
+            tables: "".into(), field_filters: vec![], log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
             since: None,
+            checkpoint_path: None,
+            gtid: "off".into(),
         };
         assert!(args.should_include("any_db", "any_table"));
     }
@@ -330,12 +513,14 @@ mod tests {
         let args = Args {
             host: "".into(), port: 3306, user: "".into(), password: "".into(),
             metadata_user: None, metadata_password: None,
-            server_id: 1, log_file: "".into(),
+            server_id: 1, log_file: "".into(), log_max_bytes: 0,
             databases: "app_*,legacy".into(),
-            tables: "".into(), log_level: "info".into(),
+            tables: "".into(), field_filters: vec![], log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
             since: None,
+            checkpoint_path: None,
+            gtid: "off".into(),
         };
         assert!(args.should_include("app_users", "events"));
         assert!(args.should_include("legacy", "orders"));
@@ -347,11 +532,14 @@ mod tests {
         let args = Args {
             host: "".into(), port: 3306, user: "".into(), password: "".into(),
             metadata_user: None, metadata_password: None,
-            server_id: 1, log_file: "".into(), databases: "".into(),
-            tables: "order_*,user?".into(), log_level: "info".into(),
+            server_id: 1, log_file: "".into(), log_max_bytes: 0,
+            databases: "".into(),
+            tables: "order_*,user?".into(), field_filters: vec![], log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
             since: None,
+            checkpoint_path: None,
+            gtid: "off".into(),
         };
         assert!(args.should_include("db", "order_items"));
         assert!(args.should_include("db", "user1"));
@@ -363,11 +551,14 @@ mod tests {
         let mut args = Args {
             host: "".into(), port: 3306, user: "".into(), password: "".into(),
             metadata_user: None, metadata_password: None,
-            server_id: 1, log_file: "".into(), databases: "".into(),
-            tables: "".into(), log_level: "info".into(),
+            server_id: 1, log_file: "".into(), log_max_bytes: 0,
+            databases: "".into(),
+            tables: "".into(), field_filters: vec![], log_level: "info".into(),
             gluesql_path: None, store_mode: "id-only".into(),
             binlog_start: "end".into(),
             since: None,
+            checkpoint_path: None,
+            gtid: "off".into(),
         };
         assert_eq!(args.parse_binlog_start().unwrap(), BinlogStart::End);
 

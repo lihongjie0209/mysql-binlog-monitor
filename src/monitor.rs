@@ -1,120 +1,90 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use futures::StreamExt;
 use mysql_async::binlog::events::{EventData, RowsEventData};
-use mysql_async::binlog::row::BinlogRow;
-use mysql_async::binlog::value::BinlogValue;
-use mysql_async::{BinlogStreamRequest, Opts, Pool, Value};
+use mysql_async::{BinlogStreamRequest, Opts, Pool};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use serde_json::{json, Value as JsonValue};
+use serde_json::json;
 
+use crate::checkpoint::{self, BinlogPosition, CheckpointState, StartKind};
 use crate::config::Args;
 use crate::db::{ColMap, PkMap};
+use crate::ddl::is_schema_changing_ddl;
+use crate::event::{binlog_row_to_json, build_change_event, extract_pk};
+use crate::field_filter::{self, FieldPredicate};
+use crate::gtid::{format_gtid, ExecutedGtidSet, GtidPreference};
 use crate::logger::Logger;
 use crate::storage::{EventStorage, StoreMode};
 
-// ── Value serialization ────────────────────────────────────────────────────────
-
-fn bytes_to_hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
+/// Update in-memory file:pos and optionally flush the full checkpoint (incl. GTID set).
+fn note_position(
+    runtime_pos: &mut Option<BinlogPosition>,
+    current_file: &Option<String>,
+    log_pos: u64,
+    executed: &ExecutedGtidSet,
+    last_gtid: Option<&str>,
+    checkpoint_path: Option<&str>,
+    logger: &Logger,
+) {
+    if log_pos > 0 {
+        if let Some(file) = current_file.as_ref() {
+            *runtime_pos = Some(BinlogPosition::new(file.clone(), log_pos));
+        }
+    }
+    persist_checkpoint(checkpoint_path, runtime_pos, executed, last_gtid, logger);
 }
 
-fn value_to_json(v: Value) -> JsonValue {
-    match v {
-        Value::NULL => JsonValue::Null,
-        Value::Bytes(b) => match String::from_utf8(b) {
-            Ok(s) => JsonValue::String(s),
-            Err(e) => JsonValue::String(format!("0x{}", bytes_to_hex(e.as_bytes()))),
+fn persist_checkpoint(
+    checkpoint_path: Option<&str>,
+    runtime_pos: &Option<BinlogPosition>,
+    executed: &ExecutedGtidSet,
+    last_gtid: Option<&str>,
+    logger: &Logger,
+) {
+    let Some(path) = checkpoint_path else {
+        return;
+    };
+    let state = CheckpointState {
+        position: runtime_pos.clone(),
+        gtid_set: if executed.is_empty() {
+            None
+        } else {
+            Some(executed.to_mysql_string())
         },
-        Value::Int(i) => json!(i),
-        Value::UInt(u) => json!(u),
-        Value::Float(f) => json!(f as f64),
-        Value::Double(d) => json!(d),
-        Value::Date(y, mo, d, h, mi, s, us) => {
-            if h == 0 && mi == 0 && s == 0 && us == 0 {
-                JsonValue::String(format!("{:04}-{:02}-{:02}", y, mo, d))
-            } else {
-                JsonValue::String(format!(
-                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
-                    y, mo, d, h, mi, s, us
-                ))
-            }
-        }
-        Value::Time(neg, days, h, mi, s, us) => {
-            let total_h = days * 24 + h as u32;
-            let sign = if neg { "-" } else { "" };
-            JsonValue::String(format!("{}{:02}:{:02}:{:02}.{:06}", sign, total_h, mi, s, us))
-        }
+        last_gtid: last_gtid.map(|s| s.to_string()),
+    };
+    if state.position.is_none() && state.gtid_set.is_none() {
+        return;
     }
-}
-
-fn binlog_value_to_json(val: BinlogValue<'_>) -> JsonValue {
-    match val {
-        BinlogValue::Value(v) => value_to_json(v),
-        // Serialize JSONB and JsonDiff as debug strings — rarely encountered in practice
-        BinlogValue::Jsonb(j) => JsonValue::String(format!("{:?}", j)),
-        BinlogValue::JsonDiff(d) => JsonValue::String(format!("{:?}", d)),
+    if let Err(e) = checkpoint::save(Path::new(path), &state) {
+        logger.warn(json!({
+            "message": "Failed to write checkpoint",
+            "path": path,
+            "error": e.to_string(),
+        }));
     }
-}
-
-/// Convert a BinlogRow to a JSON object using `col_names` for field names.
-/// Falls back to `col_0`, `col_1`, ... when the name list is shorter than the row.
-fn binlog_row_to_json(row: &BinlogRow, col_names: &[String]) -> JsonValue {
-    let mut map = serde_json::Map::new();
-    for i in 0..row.len() {
-        let key = col_names
-            .get(i)
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_else(|| format!("col_{}", i));
-        let json_val = match row.as_ref(i) {
-            None => JsonValue::Null,
-            Some(bv) => binlog_value_to_json(bv.clone()),
-        };
-        map.insert(key, json_val);
-    }
-    JsonValue::Object(map)
-}
-
-// ── Primary key extraction ─────────────────────────────────────────────────────
-
-/// Extract the primary key value from a row's JSON object using the cached PK column list.
-///
-/// - Single-column PK → scalar value
-/// - Composite PK     → `{ "col1": v1, "col2": v2 }`
-/// - No PK metadata   → fallback: look for `id` / `ID` / `Id`; return `null` if absent
-fn extract_pk(values: &serde_json::Map<String, JsonValue>, pk_columns: &[String]) -> JsonValue {
-    if !pk_columns.is_empty() {
-        if pk_columns.len() == 1 {
-            return values
-                .get(&pk_columns[0])
-                .cloned()
-                .unwrap_or(JsonValue::Null);
-        }
-        let mut m = serde_json::Map::new();
-        for col in pk_columns {
-            m.insert(col.clone(), values.get(col).cloned().unwrap_or(JsonValue::Null));
-        }
-        return JsonValue::Object(m);
-    }
-    // Fallback: common naming conventions
-    for fallback in &["id", "ID", "Id"] {
-        if let Some(v) = values.get(*fallback) {
-            return v.clone();
-        }
-    }
-    JsonValue::Null
 }
 
 // ── Monitor ────────────────────────────────────────────────────────────────────
 
 pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> {
-    let logger = Logger::new(&args.log_file, &args.log_level)
+    let logger = Logger::with_max_bytes(&args.log_file, &args.log_level, args.log_max_bytes)
         .context("Failed to open log file")?;
+
+    let field_preds: Vec<FieldPredicate> = args
+        .field_predicates()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if !field_preds.is_empty() {
+        logger.info(json!({
+            "message": "Field filters active",
+            "filters": args.field_filters,
+        }));
+    }
 
     // Binlog stream URL (replication user)
     let stream_url = format!(
@@ -177,11 +147,90 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
     };
 
     // ── Stream loop with exponential-backoff reconnect ─────────────────────────
-    // On connection drop the inner loop breaks with stream_error=true; we then
-    // wait before reconnecting (1 s → 2 s → 4 s … capped at 60 s).
-    // A successful stream run resets the delay back to 1 s.
+    // On connection drop the inner loop breaks; we then wait before reconnecting
+    // (1 s → 2 s → 4 s … capped at 60 s). A successful connect resets delay to 1 s.
+    //
+    // runtime_pos is updated on every event and preferred on reconnect so we do
+    // not re-seek from the original --since / --binlog-start (avoids duplicates).
     let opts = Opts::from_url(&stream_url).context("Invalid MySQL URL")?;
     let mut backoff = Duration::from_secs(1);
+    let mut runtime_pos: Option<BinlogPosition> = None;
+    let mut current_file: Option<String> = None;
+    let mut executed = ExecutedGtidSet::new();
+    let mut current_gtid: Option<String> = None;
+    let mut last_gtid: Option<String> = None;
+
+    // Cold-start disk checkpoint.
+    let disk_checkpoint: Option<CheckpointState> = match &args.checkpoint_path {
+        Some(path) => match checkpoint::load(Path::new(path)) {
+            Ok(Some(st)) => {
+                logger.info(json!({
+                    "message": "Loaded checkpoint from disk",
+                    "path": path,
+                    "file": st.position.as_ref().map(|p| p.file.clone()),
+                    "pos": st.position.as_ref().map(|p| p.pos),
+                    "gtid_set": st.gtid_set,
+                    "last_gtid": st.last_gtid,
+                }));
+                if let Ok(set) = st.executed_set() {
+                    executed = set;
+                }
+                last_gtid = st.last_gtid.clone();
+                Some(st)
+            }
+            Ok(None) => {
+                logger.info(json!({ "message": "No checkpoint file yet", "path": path }));
+                None
+            }
+            Err(e) => {
+                logger.warn(json!({
+                    "message": "Failed to load checkpoint, ignoring",
+                    "path": path,
+                    "error": e.to_string(),
+                }));
+                None
+            }
+        },
+        None => None,
+    };
+
+    let binlog_start = args.parse_binlog_start().unwrap_or_else(|e| {
+        logger.warn(json!({ "message": "Bad --binlog-start value, defaulting to 'end'", "error": e }));
+        crate::config::BinlogStart::End
+    });
+
+    // ── Resolve GTID preference (auto-detect server when needed) ─────────────
+    let gtid_pref = args.gtid_preference();
+    let server_gtid_on = match gtid_pref {
+        GtidPreference::Off => false,
+        GtidPreference::Auto | GtidPreference::On => {
+            match crate::db::is_gtid_mode_on(&meta_pool).await {
+                Ok(on) => on,
+                Err(e) => {
+                    logger.warn(json!({
+                        "message": "Could not read @@gtid_mode; treating as off",
+                        "error": e.to_string(),
+                    }));
+                    false
+                }
+            }
+        }
+    };
+    let gtid_enabled = gtid_pref.resolve(server_gtid_on);
+    if gtid_pref.forced_but_unavailable(server_gtid_on) {
+        logger.warn(json!({
+            "message": "--gtid on requested but server gtid_mode is not ON; falling back to file:pos",
+            "preference": args.gtid,
+            "server_gtid_on": server_gtid_on,
+        }));
+    } else {
+        logger.info(json!({
+            "message": "GTID streaming decision",
+            "preference": args.gtid,
+            "server_gtid_on": server_gtid_on,
+            "enabled": gtid_enabled,
+        }));
+    }
 
     'reconnect: loop {
         // ── Connect ──────────────────────────────────────────────────────────
@@ -203,97 +252,171 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
         };
 
         // ── Determine starting binlog position ───────────────────────────────
-        // --since takes precedence over --binlog-start when both are provided.
-        let master_status: Option<(String, u64)> = if let Some(since_str) = &args.since {
-            match crate::time_seek::parse_datetime(since_str) {
-                Err(e) => {
-                    logger.warn(json!({ "message": "Bad --since value, falling back to 'end'", "error": e.to_string() }));
-                    match crate::db::fetch_master_status(&meta_pool).await {
-                        Ok(s) => Some(s),
-                        Err(_) => None,
+        let runtime_gtid_str = if executed.is_empty() {
+            None
+        } else {
+            Some(executed.to_mysql_string())
+        };
+        let start_kind = checkpoint::decide_start(
+            runtime_pos.as_ref(),
+            args.since.is_some(),
+            &binlog_start,
+            disk_checkpoint.as_ref(),
+            gtid_enabled,
+            runtime_gtid_str.as_deref(),
+        );
+
+        // When Some((file,pos)) use classic dump; when Gtid mode, request is built separately.
+        let mut use_gtid_request: Option<String> = None;
+
+        let master_status: Option<(String, u64)> = match start_kind {
+            StartKind::Position(p) => {
+                logger.info(json!({
+                    "message": "Starting binlog stream from position",
+                    "file": p.file,
+                    "pos": p.pos,
+                    "source": if runtime_pos.is_some() { "runtime_resume" } else { "explicit_or_disk" },
+                }));
+                current_file = Some(p.file.clone());
+                Some((p.file, p.pos))
+            }
+            StartKind::Gtid { executed: set_str } => {
+                let set_str = if set_str.is_empty() {
+                    // Live GTID start: only stream transactions after current gtid_executed.
+                    match crate::db::fetch_gtid_executed(&meta_pool).await {
+                        Ok(s) => {
+                            if let Ok(server_set) = ExecutedGtidSet::parse(&s) {
+                                // Seed local executed set so we don't re-process on next restart
+                                // if no events arrive before exit.
+                                if executed.is_empty() {
+                                    executed = server_set;
+                                }
+                            }
+                            s
+                        }
+                        Err(e) => {
+                            logger.warn(json!({
+                                "message": "Could not read @@gtid_executed; using empty set (full history)",
+                                "error": e.to_string(),
+                            }));
+                            String::new()
+                        }
+                    }
+                } else {
+                    set_str
+                };
+                logger.info(json!({
+                    "message": "Starting binlog stream with GTID auto-position",
+                    "gtid_executed": set_str,
+                }));
+                use_gtid_request = Some(set_str);
+                None
+            }
+            StartKind::FileBegin => {
+                logger.info(json!({ "message": "Starting binlog stream from beginning of current binlog file" }));
+                None
+            }
+            StartKind::LiveEnd => {
+                match crate::db::fetch_master_status(&meta_pool).await {
+                    Ok(status) => {
+                        logger.info(json!({
+                            "message": "Starting binlog stream from current position",
+                            "file": status.0,
+                            "pos": status.1,
+                        }));
+                        current_file = Some(status.0.clone());
+                        Some(status)
+                    }
+                    Err(e) => {
+                        logger.warn(json!({
+                            "message": "Could not fetch master status; starting from beginning of current file",
+                            "error": e.to_string(),
+                        }));
+                        None
                     }
                 }
-                Ok(target_ts) => {
-                    logger.info(json!({
-                        "message": "Seeking binlog position by time",
-                        "since":      since_str,
-                        "target_unix": target_ts,
-                    }));
-                    match crate::db::fetch_binary_logs(&meta_pool).await {
-                        Err(e) => {
-                            logger.warn(json!({ "message": "Could not list binary logs", "error": e.to_string() }));
-                            None
+            }
+            StartKind::TimeSeek => {
+                let since_str = args.since.as_deref().unwrap_or("");
+                match crate::time_seek::parse_datetime(since_str) {
+                    Err(e) => {
+                        logger.warn(json!({ "message": "Bad --since value, falling back to 'end'", "error": e.to_string() }));
+                        match crate::db::fetch_master_status(&meta_pool).await {
+                            Ok(s) => {
+                                current_file = Some(s.0.clone());
+                                Some(s)
+                            }
+                            Err(_) => None,
                         }
-                        Ok(files) => {
-                            let (cur_file, cur_pos) = crate::db::fetch_master_status(&meta_pool)
-                                .await
-                                .unwrap_or_default();
-                            match crate::time_seek::find_pos_by_time(
-                                &meta_pool, args.server_id, &files, target_ts, &cur_file, cur_pos,
-                            ).await {
-                                Err(e) => {
-                                    logger.warn(json!({ "message": "Time seek failed, using current pos", "error": e.to_string() }));
-                                    Some((cur_file, cur_pos))
-                                }
-                                Ok((file, pos)) => {
-                                    logger.info(json!({
-                                        "message": "Binlog position found by time seek",
-                                        "file": file,
-                                        "pos":  pos,
-                                    }));
-                                    Some((file, pos))
+                    }
+                    Ok(target_ts) => {
+                        logger.info(json!({
+                            "message": "Seeking binlog position by time",
+                            "since": since_str,
+                            "target_unix": target_ts,
+                        }));
+                        match crate::db::fetch_binary_logs(&meta_pool).await {
+                            Err(e) => {
+                                logger.warn(json!({ "message": "Could not list binary logs", "error": e.to_string() }));
+                                None
+                            }
+                            Ok(files) => {
+                                let (cur_file, cur_pos) = crate::db::fetch_master_status(&meta_pool)
+                                    .await
+                                    .unwrap_or_default();
+                                match crate::time_seek::find_pos_by_time(
+                                    &meta_pool, args.server_id, &files, target_ts, &cur_file, cur_pos,
+                                ).await {
+                                    Err(e) => {
+                                        logger.warn(json!({ "message": "Time seek failed, using current pos", "error": e.to_string() }));
+                                        current_file = Some(cur_file.clone());
+                                        Some((cur_file, cur_pos))
+                                    }
+                                    Ok((file, pos)) => {
+                                        logger.info(json!({
+                                            "message": "Binlog position found by time seek",
+                                            "file": file,
+                                            "pos": pos,
+                                        }));
+                                        current_file = Some(file.clone());
+                                        Some((file, pos))
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        } else {
-            let binlog_start = args.parse_binlog_start().unwrap_or_else(|e| {
-                logger.warn(json!({ "message": "Bad --binlog-start value, defaulting to 'end'", "error": e }));
-                crate::config::BinlogStart::End
-            });
-
-            match &binlog_start {
-                crate::config::BinlogStart::End => {
-                    match crate::db::fetch_master_status(&meta_pool).await {
-                        Ok(status) => {
-                            logger.info(json!({
-                                "message": "Starting binlog stream from current position",
-                                "file":    status.0,
-                                "pos":     status.1,
-                            }));
-                            Some(status)
-                        }
-                        Err(e) => {
-                            logger.warn(json!({
-                                "message": "Could not fetch master status; starting from beginning of current file",
-                                "error":   e.to_string(),
-                            }));
-                            None
-                        }
-                    }
-                }
-                crate::config::BinlogStart::Start => {
-                    logger.info(json!({ "message": "Starting binlog stream from beginning of current binlog file" }));
-                    None
-                }
-                crate::config::BinlogStart::At { file, pos } => {
-                    logger.info(json!({
-                        "message": "Starting binlog stream from specified position",
-                        "file":    file,
-                        "pos":     pos,
-                    }));
-                    Some((file.clone(), *pos))
-                }
-            }
         };
 
-        let request = match &master_status {
-            Some((file, pos)) => BinlogStreamRequest::new(args.server_id)
-                .with_filename(file.as_bytes())
-                .with_pos(*pos),
-            None => BinlogStreamRequest::new(args.server_id),
+        // Build stream request. GTID mode needs owned Sids for the request lifetime.
+        let gtid_sids_owned: Option<Vec<mysql_async::Sid<'static>>> =
+            if let Some(ref set_str) = use_gtid_request {
+                match ExecutedGtidSet::parse(set_str).and_then(|s| s.to_sids()) {
+                    Ok(sids) => Some(sids),
+                    Err(e) => {
+                        logger.warn(json!({
+                            "message": "Failed to build GTID set for stream request",
+                            "error": e.to_string(),
+                        }));
+                        Some(Vec::new())
+                    }
+                }
+            } else {
+                None
+            };
+
+        let request = if let Some(ref sids) = gtid_sids_owned {
+            BinlogStreamRequest::new(args.server_id)
+                .with_gtid()
+                .with_gtid_set(sids.clone())
+        } else {
+            match &master_status {
+                Some((file, pos)) => BinlogStreamRequest::new(args.server_id)
+                    .with_filename(file.as_bytes())
+                    .with_pos(*pos),
+                None => BinlogStreamRequest::new(args.server_id),
+            }
         };
         let mut stream = match conn.get_binlog_stream(request).await {
             Ok(s) => s,
@@ -338,6 +461,7 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                     };
 
                 let ts_unix = event.header().timestamp();
+                let log_pos = event.header().log_pos() as u64;
                 let event_time = Utc
                     .timestamp_opt(ts_unix as i64, 0)
                     .single()
@@ -349,6 +473,7 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                     "message":    "Raw binlog event",
                     "event_type": format!("{:?}", event.header().event_type()),
                     "timestamp":  event.header().timestamp(),
+                    "log_pos":    log_pos,
                 }));
 
                 // Parse event data — EventData borrows from `event`
@@ -356,16 +481,163 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                     Ok(Some(d)) => d,
                     Ok(None) => {
                         logger.debug(json!({ "message": "Binlog event has no data, skipping" }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
                         continue;
                     }
                     Err(e) => {
                         logger.debug(json!({ "message": "Failed to read binlog event data", "error": e.to_string() }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
                         continue;
                     }
                 };
 
                 let re = match data {
                     EventData::RowsEvent(re) => re,
+                    EventData::GtidEvent(ref ge) => {
+                        let g = format_gtid(&ge.sid(), ge.gno());
+                        current_gtid = Some(g.clone());
+                        logger.debug(json!({ "message": "GtidEvent", "gtid": g }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
+                        continue;
+                    }
+                    EventData::AnonymousGtidEvent(ref age) => {
+                        // MySQL may emit ANONYMOUS_GTID_LOG_EVENT; still carries sid/gno.
+                        let ge = &age.0;
+                        let g = format_gtid(&ge.sid(), ge.gno());
+                        // gno==0 means truly anonymous — keep as synthetic tag for correlation only
+                        if ge.gno() > 0 {
+                            current_gtid = Some(g.clone());
+                        } else {
+                            current_gtid = Some(format!("anonymous:{}", g));
+                        }
+                        logger.debug(json!({ "message": "AnonymousGtidEvent", "gtid": g }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
+                        continue;
+                    }
+                    EventData::XidEvent(_) => {
+                        // Transaction commit — mark current GTID as executed (exactly-once resume).
+                        if let Some(g) = current_gtid.take() {
+                            if let Err(e) = executed.add_gtid_str(&g) {
+                                logger.warn(json!({
+                                    "message": "Failed to record executed GTID",
+                                    "gtid": g,
+                                    "error": e.to_string(),
+                                }));
+                            } else {
+                                last_gtid = Some(g.clone());
+                                logger.debug(json!({
+                                    "message": "Committed GTID",
+                                    "gtid": g,
+                                    "gtid_set": executed.to_mysql_string(),
+                                }));
+                            }
+                        }
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
+                        continue;
+                    }
+                    EventData::QueryEvent(ref qe) => {
+                        let sql = qe.query();
+                        if is_schema_changing_ddl(&sql) {
+                            // Table layout may have changed — drop cached column/PK maps.
+                            // Next row event re-fetches metadata lazily per table.
+                            let cleared = col_map.len() + pk_map.len();
+                            col_map.clear();
+                            pk_map.clear();
+                            logger.info(json!({
+                                "message": "Schema-changing DDL detected; metadata cache cleared",
+                                "schema": qe.schema(),
+                                "query": sql.chars().take(200).collect::<String>(),
+                                "entries_cleared": cleared,
+                            }));
+                        } else {
+                            logger.debug(json!({
+                                "message": "QueryEvent (non-DDL)",
+                                "schema": qe.schema(),
+                                "query": sql.chars().take(120).collect::<String>(),
+                            }));
+                        }
+                        // Only DDL auto-commit ends a GTID group here without XidEvent.
+                        // Do NOT clear current_gtid on BEGIN/COMMIT QueryEvents — ROW
+                        // transactions still need it for the following RowsEvent.
+                        if is_schema_changing_ddl(&sql) {
+                            if let Some(g) = current_gtid.take() {
+                                let _ = executed.add_gtid_str(&g);
+                                last_gtid = Some(g);
+                            }
+                        }
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
+                        continue;
+                    }
+                    EventData::RotateEvent(ref re) => {
+                        // Real + fake rotate both carry the next (or current) file name.
+                        let file = re.name().into_owned();
+                        let pos = if re.position() > 0 { re.position() } else { 4 };
+                        current_file = Some(file.clone());
+                        logger.debug(json!({
+                            "message": "RotateEvent",
+                            "file": file,
+                            "pos": pos,
+                            "fake": re.is_fake(),
+                        }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
+                        continue;
+                    }
                     EventData::TableMapEvent(ref tme_data) => {
                         logger.debug(json!({
                             "message":  "TableMapEvent received",
@@ -373,10 +645,28 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                             "database": tme_data.database_name(),
                             "table":    tme_data.table_name(),
                         }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
                         continue;
                     }
                     other => {
                         logger.debug(json!({ "message": "Non-rows event, skipping", "event_type": format!("{other:?}").split('(').next().unwrap_or("unknown") }));
+                        note_position(
+                            &mut runtime_pos,
+                            &current_file,
+                            log_pos,
+                            &executed,
+                            last_gtid.as_deref(),
+                            args.checkpoint_path.as_deref(),
+                            &logger,
+                        );
                         continue;
                     }
                 };
@@ -415,6 +705,16 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                         "filter_databases": args.filter_databases(),
                         "filter_tables":    args.filter_tables(),
                     }));
+                    // Advance checkpoint even for filtered events so reconnect skips them.
+                    note_position(
+                        &mut runtime_pos,
+                        &current_file,
+                        log_pos,
+                        &executed,
+                        last_gtid.as_deref(),
+                        args.checkpoint_path.as_deref(),
+                        &logger,
+                    );
                     continue;
                 }
 
@@ -465,27 +765,57 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
                         }
                     };
 
+                    if !field_filter::row_matches_fields(&row_value, &field_preds) {
+                        logger.debug(json!({
+                            "message": "Event filtered by field-filter",
+                            "database": database,
+                            "table": table,
+                            "filters": args.field_filters,
+                        }));
+                        continue;
+                    }
+
                     let primary_key = extract_pk(&pk_source_obj, &pk_columns);
 
-                    let event_json = json!({
-                        "timestamp":   event_time,
-                        "event_time":  ts_unix,
-                        "operation":   operation,
-                        "database":    database,
-                        "table":       table,
-                        "pk_columns":  if pk_columns.is_empty() { JsonValue::Null } else { json!(pk_columns) },
-                        "primary_key": primary_key,
-                        "row":         row_value,
-                    });
+                    let event_json = build_change_event(
+                        &event_time,
+                        ts_unix,
+                        operation,
+                        &database,
+                        &table,
+                        &pk_columns,
+                        primary_key,
+                        row_value,
+                        current_gtid.as_deref(),
+                    );
 
                     logger.info(event_json.clone());
 
                     if let Some(storage) = event_storage.as_mut() {
-                        if let Err(e) = storage.insert(&event_json).await {
-                            logger.warn(json!({ "message": "GlueSQL insert failed", "error": e.to_string() }));
+                        match storage.insert(&event_json).await {
+                            Ok(false) => logger.debug(json!({
+                                "message": "Skipped duplicate GTID event (exactly-once sink)",
+                                "gtid": current_gtid,
+                            })),
+                            Ok(true) => {}
+                            Err(e) => logger.warn(json!({
+                                "message": "GlueSQL insert failed",
+                                "error": e.to_string()
+                            })),
                         }
                     }
                 }
+
+                // Advance after the rows event is fully processed.
+                note_position(
+                    &mut runtime_pos,
+                    &current_file,
+                    log_pos,
+                    &executed,
+                    last_gtid.as_deref(),
+                    args.checkpoint_path.as_deref(),
+                    &logger,
+                );
             }
             _ = shutdown.cancelled() => {
                 logger.info(json!({ "message": "Received Ctrl+C, shutting down" }));

@@ -99,6 +99,44 @@ pub async fn fetch_master_status(pool: &Pool) -> Result<(String, u64)> {
     Ok((file, pos))
 }
 
+/// Return `@@GLOBAL.gtid_executed` (empty string when GTID is off / empty).
+pub async fn fetch_gtid_executed(pool: &Pool) -> Result<String> {
+    let mut conn = pool.get_conn().await?;
+    let row: Option<mysql_async::Row> = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await?;
+    let Some(row) = row else {
+        return Ok(String::new());
+    };
+    Ok(row_to_string(&row, 0).unwrap_or_default())
+}
+
+/// Return true when `@@GLOBAL.gtid_mode` is fully `ON`.
+///
+/// Values like `OFF_PERMISSIVE` / `ON_PERMISSIVE` are treated as not fully on
+/// for COM_BINLOG_DUMP_GTID auto-position.
+pub async fn is_gtid_mode_on(pool: &Pool) -> Result<bool> {
+    let mut conn = pool.get_conn().await?;
+    let row: Option<mysql_async::Row> = conn
+        .query_first("SELECT @@GLOBAL.gtid_mode")
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let mode = row_to_string(&row, 0).unwrap_or_default();
+    Ok(mode.eq_ignore_ascii_case("ON"))
+}
+
+fn row_to_string(row: &mysql_async::Row, idx: usize) -> Option<String> {
+    if let Some(s) = row.get::<String, _>(idx) {
+        return Some(s);
+    }
+    if let Some(b) = row.get::<Vec<u8>, _>(idx) {
+        return Some(String::from_utf8_lossy(&b).into_owned());
+    }
+    None
+}
+
 /// Fetch column names for a single table (used for newly-seen tables).
 pub async fn fetch_column_names_for_table(
     pool: &Pool,

@@ -1,8 +1,14 @@
 pub mod binlog_info;
+pub mod checkpoint;
 pub mod config;
 pub mod db;
+pub mod ddl;
+pub mod event;
 pub mod export;
+pub mod field_filter;
+pub mod gtid;
 pub mod logger;
 pub mod monitor;
+pub mod scan;
 pub mod storage;
 pub mod time_seek;

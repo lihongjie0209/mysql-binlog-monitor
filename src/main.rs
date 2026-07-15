@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
             });
             mysql_binlog_monitor::monitor::run_monitor(args, shutdown).await
         }
+        Command::Scan(args) => mysql_binlog_monitor::scan::run_scan(args).await,
         Command::Export(args) => mysql_binlog_monitor::export::run_export(args).await,
         Command::BinlogInfo(args) => mysql_binlog_monitor::binlog_info::run_binlog_info(args).await,
     }
