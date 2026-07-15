@@ -16,6 +16,9 @@ pub async fn run_binlog_info(args: BinlogInfoArgs) -> Result<()> {
         .into();
     let pool = Pool::new(opts);
 
+    // Fail fast with CREATE USER / GRANT guidance when privileges are missing
+    crate::privileges::require_stream_privileges(&pool, &args.user).await?;
+
     let files           = fetch_binary_logs(&pool).await?;
     let (cur_file, cur_pos) = fetch_master_status(&pool).await?;
 

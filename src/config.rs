@@ -39,6 +39,7 @@ pub fn parse_csv_list(s: &str) -> Vec<String> {
 #[command(
     name = "mysql-binlog-monitor",
     about = "Monitor MySQL binlog changes and export captured events.",
+    after_help = crate::privileges::HELP_MYSQL_PRIVILEGES,
     version
 )]
 pub struct Cli {
@@ -64,7 +65,8 @@ pub enum Command {
 #[command(
     about = "Monitor MySQL binlog changes and output structured JSON logs.\n\
              Events (INSERT/UPDATE/DELETE) are logged with table name, primary key,\n\
-             timestamp, database name, and full row data."
+             timestamp, database name, and full row data.",
+    after_help = crate::privileges::HELP_MYSQL_PRIVILEGES
 )]
 pub struct Args {
     /// MySQL host
@@ -260,7 +262,8 @@ impl Args {
 #[command(
     about = "One-shot scan of historical binlog changes (does not keep running).\n\
              Filter by database/table wildcards and optional --since / --until time range.\n\
-             Writes one JSON event per line to stdout or --output."
+             Writes one JSON event per line to stdout or --output.",
+    after_help = crate::privileges::HELP_MYSQL_PRIVILEGES
 )]
 pub struct ScanArgs {
     /// MySQL host
@@ -422,7 +425,10 @@ pub struct ExportArgs {
 // ── BinlogInfo args ────────────────────────────────────────────────────────────
 
 #[derive(clap::Args, Debug, Clone)]
-#[command(about = "Show available binlog files and the current write position.")]
+#[command(
+    about = "Show available binlog files and the current write position.",
+    after_help = crate::privileges::HELP_MYSQL_PRIVILEGES
+)]
 pub struct BinlogInfoArgs {
     /// MySQL host
     #[arg(long, default_value = "127.0.0.1")]
@@ -432,7 +438,7 @@ pub struct BinlogInfoArgs {
     #[arg(long, default_value_t = 3306)]
     pub port: u16,
 
-    /// MySQL user (needs REPLICATION CLIENT privilege)
+    /// MySQL user (needs REPLICATION CLIENT + REPLICATION SLAVE)
     #[arg(long, default_value = "root")]
     pub user: String,
 

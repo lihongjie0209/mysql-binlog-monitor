@@ -9,6 +9,7 @@ pub mod field_filter;
 pub mod gtid;
 pub mod logger;
 pub mod monitor;
+pub mod privileges;
 pub mod scan;
 pub mod storage;
 pub mod time_seek;

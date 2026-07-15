@@ -79,12 +79,48 @@ binlog-row-image = FULL
 server-id        = 1
 ```
 
+### Required privileges
+
+| Privilege | Why |
+|---|---|
+| `REPLICATION CLIENT` | `SHOW MASTER STATUS` / `SHOW BINARY LOGS` |
+| `REPLICATION SLAVE` | Open the binlog dump stream |
+| `SELECT` on `information_schema` (optional) | Resolve column names and primary keys; without it, logs use `col_N` / PK falls back to `"id"` |
+
+On startup, `monitor` / `scan` / `binlog-info` check these privileges and print **CREATE USER / GRANT** guidance when something is missing. The same examples appear in `mysql-binlog-monitor --help`.
+
+### Create a new user
+
 ```sql
--- Replication user (required)
+CREATE USER 'repl'@'%' IDENTIFIED BY 'your_password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+GRANT SELECT ON information_schema.* TO 'repl'@'%';
+FLUSH PRIVILEGES;
+```
+
+### Grant to an existing user
+
+```sql
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'existing_user'@'%';
+GRANT SELECT ON information_schema.* TO 'existing_user'@'%';
+FLUSH PRIVILEGES;
+```
+
+### Split credentials (replication user without SELECT)
+
+```sql
+CREATE USER 'repl'@'%' IDENTIFIED BY 'repl_password';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
 
--- Optional: separate read-only user for information_schema
+CREATE USER 'meta'@'%' IDENTIFIED BY 'meta_password';
 GRANT SELECT ON information_schema.* TO 'meta'@'%';
+FLUSH PRIVILEGES;
+```
+
+```bash
+mysql-binlog-monitor monitor \
+  --user repl --password repl_password \
+  --metadata-user meta --metadata-password meta_password
 ```
 
 ---
@@ -570,6 +606,7 @@ mysql-binlog-monitor/
 │   ├── binlog_info.rs      # binlog-info subcommand
 │   ├── time_seek.rs        # datetime parse + file/offset seek
 │   ├── db.rs               # information_schema / BINARY LOGS helpers
+│   ├── privileges.rs       # privilege check + CREATE USER / GRANT guidance
 │   ├── logger.rs           # JSON log writer
 │   ├── storage.rs          # GlueSQL EventStorage
 │   └── export.rs           # GlueSQL export

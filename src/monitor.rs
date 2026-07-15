@@ -100,6 +100,26 @@ pub async fn run_monitor(args: Args, shutdown: CancellationToken) -> Result<()> 
         meta_user, meta_pass, args.host, args.port
     );
     let meta_pool = Pool::new(meta_url.as_str());
+    // Temporary pool for privilege checks on the stream user
+    let stream_check_pool = Pool::new(stream_url.as_str());
+
+    // ── Privilege check (fail fast with GRANT / CREATE USER guidance) ──────────
+    let stream_warnings =
+        crate::privileges::require_stream_privileges(&stream_check_pool, &args.user).await?;
+    let _ = stream_check_pool.disconnect().await;
+    // SELECT on stream user only matters when it is also the metadata user
+    if args.metadata_user.is_none() {
+        for w in stream_warnings {
+            logger.warn(json!({ "message": "MySQL privilege warning", "detail": w }));
+        }
+    }
+    if let Some(w) = crate::privileges::metadata_select_warning(&meta_pool, meta_user).await {
+        logger.warn(json!({
+            "message": "Metadata user cannot SELECT information_schema; column/PK names may be incomplete",
+            "user": meta_user,
+            "guidance": w,
+        }));
+    }
 
     // ── GlueSQL storage (optional) ─────────────────────────────────────────────
     let mut event_storage: Option<EventStorage> = match &args.gluesql_path {

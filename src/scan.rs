@@ -55,6 +55,28 @@ pub async fn run_scan(args: ScanArgs) -> Result<()> {
     );
 
     let meta_pool = Pool::new(Opts::from_url(&meta_url).context("Invalid MySQL URL")?);
+    let stream_check_pool =
+        Pool::new(Opts::from_url(&stream_url).context("Invalid MySQL stream URL")?);
+
+    // Fail fast with CREATE USER / GRANT guidance when binlog privileges are missing
+    let stream_warnings =
+        crate::privileges::require_stream_privileges(&stream_check_pool, &args.user).await?;
+    let _ = stream_check_pool.disconnect().await;
+    if args.metadata_user.is_none() {
+        for w in stream_warnings {
+            eprintln!("{}", json!({ "message": "privilege_warning", "detail": w }));
+        }
+    }
+    if let Some(w) = crate::privileges::metadata_select_warning(&meta_pool, meta_user).await {
+        eprintln!(
+            "{}",
+            json!({
+                "message": "metadata_privilege_warning",
+                "user": meta_user,
+                "guidance": w,
+            })
+        );
+    }
 
     let mut col_map: ColMap = db::fetch_all_column_names(&meta_pool)
         .await
